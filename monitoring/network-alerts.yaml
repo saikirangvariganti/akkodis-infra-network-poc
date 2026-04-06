@@ -1,0 +1,201 @@
+---
+# akkodis-infra-network-poc — network-alerts.yaml
+# Prometheus alerting rules for cloud network infrastructure monitoring
+# Deploy: cp network-alerts.yaml /etc/prometheus/rules/network-alerts.yaml
+#         curl -X POST http://localhost:9090/-/reload
+
+groups:
+  - name: network_availability
+    interval: 30s
+    rules:
+      - alert: NetworkEndpointDown
+        expr: probe_success{job="blackbox"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "Network endpoint unreachable: {{ $labels.instance }}"
+          description: |
+            Blackbox prober cannot reach {{ $labels.instance }} (module: {{ $labels.module }}).
+            Possible causes: VPN tunnel down, NSG rule change, host down, DNS failure.
+          runbook: "https://wiki.internal/runbooks/endpoint-down"
+
+      - alert: VPNTunnelDown
+        expr: aws_vpn_tunnel_state{state="UP"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "VPN tunnel down: {{ $labels.vpn_id }}"
+          description: "AWS VPN tunnel {{ $labels.vpn_id }} has been down for more than 5 minutes. Hybrid connectivity to on-premises may be affected."
+          runbook: "https://wiki.internal/runbooks/vpn-tunnel-down"
+
+      - alert: TransitGatewayAttachmentDown
+        expr: aws_tgw_attachment_state{state="available"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "Transit Gateway attachment unavailable: {{ $labels.attachment_id }}"
+          description: "TGW attachment {{ $labels.attachment_id }} is not in 'available' state — routing may be impaired."
+
+  - name: network_latency
+    interval: 60s
+    rules:
+      - alert: HighNetworkLatency
+        expr: probe_duration_seconds{job="blackbox"} * 1000 > 100
+        for: 5m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "High network latency to {{ $labels.instance }}"
+          description: "Round-trip time to {{ $labels.instance }} is {{ $value | humanize }}ms (threshold: 100ms) sustained for 5 minutes."
+
+      - alert: CriticalNetworkLatency
+        expr: probe_duration_seconds{job="blackbox"} * 1000 > 300
+        for: 3m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "Critical network latency to {{ $labels.instance }}"
+          description: "RTT to {{ $labels.instance }} is {{ $value | humanize }}ms — user experience severely impacted."
+
+      - alert: HighPacketLoss
+        expr: |
+          1 - (rate(probe_success{job="blackbox"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "High packet loss to {{ $labels.instance }}"
+          description: "Packet loss rate to {{ $labels.instance }} is {{ $value | humanizePercentage }} (threshold: 5%) over 10 minutes."
+
+  - name: network_dns
+    interval: 60s
+    rules:
+      - alert: DNSResolutionFailure
+        expr: probe_dns_lookup_time_seconds{job="dns_check"} > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "Slow DNS resolution for {{ $labels.instance }}"
+          description: "DNS resolution for {{ $labels.instance }} is taking {{ $value | humanize }}s (threshold: 2s)."
+
+      - alert: PrivateDNSZoneQueryFailure
+        expr: probe_success{job="dns_check", module="dns_private"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "Private DNS zone query failing: {{ $labels.instance }}"
+          description: |
+            DNS queries to private zone {{ $labels.instance }} are failing.
+            Check Route 53 Resolver endpoint health and NSG/SG rules on port 53.
+
+      - alert: DNSPropagationDelay
+        expr: |
+          probe_dns_lookup_time_seconds{job="dns_check"} > 5
+        for: 2m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "DNS propagation delay detected for {{ $labels.instance }}"
+          description: "DNS lookup for {{ $labels.instance }} taking {{ $value | humanize }}s — possible resolver issue."
+
+  - name: network_bgp
+    interval: 60s
+    rules:
+      - alert: BGPPeerDown
+        expr: bgp_neighbor_state{state="Established"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          team: network
+        annotations:
+          summary: "BGP peer session down: {{ $labels.peer }}"
+          description: |
+            BGP session with peer {{ $labels.peer }} (ASN {{ $labels.peer_asn }}) has dropped.
+            Route advertisements from this peer are no longer being received.
+            Check VPN tunnel status and peer router connectivity.
+          runbook: "https://wiki.internal/runbooks/bgp-peer-down"
+
+      - alert: BGPRoutesDecreased
+        expr: |
+          delta(bgp_received_prefixes_total[10m]) < -5
+        for: 5m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "BGP route count decreased from {{ $labels.peer }}"
+          description: "Number of BGP prefixes received from {{ $labels.peer }} decreased by {{ $value | humanize }} — possible route withdrawal."
+
+  - name: network_security
+    interval: 60s
+    rules:
+      - alert: SecurityGroupAuditFailed
+        expr: vpc_audit_critical_findings_total > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Critical security group findings detected"
+          description: "VPC audit found {{ $value }} critical security group misconfiguration(s) — overly permissive rules detected."
+          runbook: "https://wiki.internal/runbooks/sg-audit-failure"
+
+      - alert: NSGRuleChanged
+        expr: increase(azure_nsg_rule_changes_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Azure NSG rule changed"
+          description: "{{ $value }} NSG rule change(s) detected in the last 15 minutes — verify change was authorised via CAB."
+
+      - alert: UnauthorisedPortScan
+        expr: |
+          rate(node_network_receive_drop_total[5m]) > 100
+        for: 3m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Possible port scan detected on {{ $labels.instance }}"
+          description: "High rate of dropped packets on {{ $labels.instance }}:{{ $labels.device }} — possible port scanning activity."
+
+  - name: network_bandwidth
+    interval: 60s
+    rules:
+      - alert: HighInboundBandwidth
+        expr: |
+          rate(node_network_receive_bytes_total[5m]) * 8 / 1e9 > 1
+        for: 10m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "High inbound bandwidth on {{ $labels.instance }}"
+          description: "Inbound bandwidth on {{ $labels.instance }}:{{ $labels.device }} is {{ $value | humanize }}Gbps (threshold: 1Gbps)."
+
+      - alert: NATGatewayHighUsage
+        expr: |
+          aws_nat_gateway_bytes_out_to_destination_sum / 1e9 > 50
+        for: 30m
+        labels:
+          severity: warning
+          team: network
+        annotations:
+          summary: "High NAT Gateway data transfer: {{ $labels.nat_gateway_id }}"
+          description: "NAT Gateway {{ $labels.nat_gateway_id }} has processed {{ $value | humanize }}GB — review for unexpected data transfer costs."
